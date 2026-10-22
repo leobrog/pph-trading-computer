@@ -19,6 +19,7 @@ import {
   findInternalTradeRoutes,
   findProfitableTradeRoutes,
   findUndermineLossRoutes,
+  getStationMarketListings,
 } from "../src/db/queries/trading.ts";
 
 let dbReachable = false;
@@ -511,6 +512,37 @@ describe.skipIf(!dbReachable)("Trading & BGS Database Queries Integration Suite"
     expect(woodroffe?.faction_influence).toBeCloseTo(0.642, 3);
     expect(woodroffe?.controlling_faction_state).toBe("Boom");
     expect(woodroffe?.listings_count).toBe(3);
+  });
+
+  test("returns commodity listings for a specific market with supply/demand filtering", async () => {
+    const allRes = await getStationMarketListings({
+      station: "Woodroffe Gateway",
+      system: TEST_SYS_HEVERTY,
+    });
+    expect(allRes.station?.station_name).toBe("Woodroffe Gateway");
+    expect(allRes.station?.system_name).toBe(TEST_SYS_HEVERTY);
+    expect(allRes.station?.total_listings_count).toBe(3);
+    expect(allRes.station?.supply_count).toBe(2);
+    expect(allRes.station?.demand_count).toBe(1);
+    expect(allRes.listings.length).toBe(3);
+
+    const supplyOnly = await getStationMarketListings({
+      station: "Woodroffe Gateway",
+      system: TEST_SYS_HEVERTY,
+      filter: "supply",
+    });
+    expect(supplyOnly.listings.length).toBe(2);
+    expect(supplyOnly.listings.every((l) => l.buy_price > 0 && l.stock > 0)).toBe(true);
+
+    const demandOnly = await getStationMarketListings({
+      station: "Woodroffe Gateway",
+      system: TEST_SYS_HEVERTY,
+      filter: "demand",
+      minDemand: 1000,
+    });
+    expect(demandOnly.listings.length).toBe(1);
+    expect(demandOnly.listings[0]?.commodity_name).toBe("Gold");
+    expect(demandOnly.listings[0]?.sell_price).toBe(58000);
   });
 
   test("generates comprehensive system BGS report and multi-system faction status report", async () => {

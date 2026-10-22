@@ -14,11 +14,12 @@ import {
 describe("Bot Command Registry & UI Helpers", () => {
   test("auto-discovers *.command.ts files via Bun.Glob and validates schemas", async () => {
     const commands = await loadCommands(undefined, true);
-    expect(commands.size).toBe(11);
+    expect(commands.size).toBe(12);
     expect(commands.has("trade-route")).toBe(true);
     expect(commands.has("internal-route")).toBe(true);
     expect(commands.has("commodity-buy")).toBe(true);
     expect(commands.has("commodity-sell")).toBe(true);
+    expect(commands.has("market-listings")).toBe(true);
     expect(commands.has("undermine-trade")).toBe(true);
     expect(commands.has("faction-markets")).toBe(true);
     expect(commands.has("system-report")).toBe(true);

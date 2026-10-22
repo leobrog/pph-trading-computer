@@ -39,6 +39,7 @@ For detailed architectural research and implementation docs, see [docs/README.md
 | `/internal-route` | **Trading** | Finds the most profitable internal (in-system) commodity trade routes between markets within the same star system. |
 | `/commodity-buy` | **Trading** | Finds the cheapest recorded buying prices and supply stock for a commodity (galactic or near a reference system). |
 | `/commodity-sell` | **Trading** | Finds the highest recorded selling prices and demand for a commodity (galactic or near a reference system). |
+| `/market-listings` | **Trading** | Displays all recorded commodity buy/sell prices, supply stock, and demand for a specific market/station. |
 | `/undermine-trade` | **BGS** | Finds loss trade routes (`sell_price < buy_price`) targeting a system, station, or minor faction to inflict negative BGS influence (`budget_loss` or `heavy_loss` strategies). Automatically excludes Fleet Carriers as targets. |
 | `/system-report` | **BGS** | Displays a full BGS intelligence report for a star system (population, security, minor faction influence rankings, active/pending/recovering states, tactical alerts, and stations). |
 | `/faction-status` | **BGS** | Displays a Minor Faction's multi-system BGS overview across all inhabited systems (influence %, rival margins, active/pending/recovering states, and controlled assets). |

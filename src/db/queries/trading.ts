@@ -1,7 +1,22 @@
 import { env } from "../../config/env.ts";
 import { resolveSystemFromEdsm } from "../../listener/coord-resolver.ts";
-import type { LandingPadSize } from "../../listener/normalizer.ts";
+import {
+  cleanFdevToken,
+  cleanStationName,
+  inferMaxLandingPad,
+  isColonisationVessel,
+  isFleetCarrier,
+  type LandingPadSize,
+} from "../../listener/normalizer.ts";
 import { sql } from "../index.ts";
+import {
+  initCommodityCache,
+  type MarketCommodityItem,
+  resolveCommodityId,
+  upsertStationMarket,
+  upsertStationMeta,
+  upsertSystem,
+} from "./ingest.ts";
 
 export type PadFilter = "L" | "M" | "Any";
 
@@ -931,4 +946,426 @@ export async function findFactionMarkets(
       st.name ASC
     LIMIT ${safeLimit}
   `;
+}
+
+export type MarketListingsFilter = "all" | "supply" | "demand";
+
+export type MarketListingsSortBy =
+  | "category"
+  | "sell_price"
+  | "buy_price"
+  | "stock"
+  | "demand"
+  | "name";
+
+export interface MarketStationInfo {
+  market_id: string;
+  station_name: string;
+  station_type: string | null;
+  is_fleet_carrier: boolean;
+  is_colonisation_vessel: boolean;
+  max_landing_pad: LandingPadSize;
+  distance_to_arrival_ls: number | null;
+  controlling_faction: string | null;
+  controlling_faction_state: string | null;
+  government: string | null;
+  primary_economy: string | null;
+  has_blackmarket: boolean;
+  system_id: number;
+  system_name: string;
+  market_updated_at: Date | string | null;
+  updated_at: Date | string;
+  total_listings_count: number;
+  supply_count: number;
+  demand_count: number;
+}
+
+export interface MarketItemRow {
+  commodity_id: number;
+  commodity_symbol: string;
+  commodity_name: string;
+  commodity_category: string;
+  is_rare: boolean;
+  mean_price: number;
+  buy_price: number;
+  stock: number;
+  stock_bracket: number | null;
+  sell_price: number;
+  demand: number;
+  demand_bracket: number | null;
+  status_flags: string[] | null;
+  updated_at: Date | string;
+}
+
+export interface GetMarketListingsParams {
+  station: string;
+  system?: string | null;
+  filter?: MarketListingsFilter;
+  commodityQuery?: string | null;
+  minStock?: number;
+  minDemand?: number;
+  sortBy?: MarketListingsSortBy;
+  limit?: number;
+}
+
+/**
+ * On-demand hydration of a station and its commodity market from Spansh when the station
+ * is not yet present or has no market listings in PostgreSQL.
+ */
+async function hydrateStationMarketOnDemand(
+  stationName: string,
+  systemName?: string | null,
+): Promise<void> {
+  if (
+    !env.edsmResolverEnabled ||
+    stationName.startsWith("PPH_TEST_") ||
+    systemName?.startsWith("PPH_TEST_")
+  ) {
+    return;
+  }
+
+  try {
+    const filters: Record<string, unknown> = {
+      name: { value: stationName },
+    };
+    if (systemName) {
+      filters.system_name = { value: systemName };
+    }
+
+    const res = await fetch("https://spansh.co.uk/api/stations/search", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "PPH-Trading-Computer/1.0",
+      },
+      body: JSON.stringify({
+        filters,
+        size: 5,
+        page: 0,
+      }),
+      signal: AbortSignal.timeout(4_500),
+    });
+
+    if (!res.ok) return;
+
+    const data = (await res.json()) as {
+      results?: Array<{
+        market_id?: number;
+        name?: string;
+        type?: string;
+        system_name?: string;
+        system_id64?: number;
+        system_x?: number;
+        system_y?: number;
+        system_z?: number;
+        system_population?: number;
+        controlling_minor_faction?: string;
+        distance_to_arrival?: number;
+        small_pads?: number;
+        medium_pads?: number;
+        large_pads?: number;
+        government?: string;
+        primary_economy?: string;
+        services?: Array<{ name?: string } | string>;
+        market?: Array<{
+          commodity?: string;
+          buy_price?: number;
+          supply?: number;
+          sell_price?: number;
+          demand?: number;
+        }>;
+        market_updated_at?: string;
+        updated_at?: string;
+      }>;
+    };
+
+    const results = data.results ?? [];
+    if (results.length === 0) return;
+
+    await initCommodityCache();
+    const commodityRows = await sql<{ id: number; name: string; symbol: string }[]>`
+      SELECT id, name, symbol FROM commodities
+    `;
+    const commodityByNameOrSymbol = new Map<string, number>();
+    for (const row of commodityRows) {
+      commodityByNameOrSymbol.set(row.name.toLowerCase(), Number(row.id));
+      commodityByNameOrSymbol.set(row.symbol.toLowerCase(), Number(row.id));
+    }
+
+    const nowIso = new Date().toISOString();
+
+    for (const st of results) {
+      if (!st.market_id || !st.name || !st.system_name) continue;
+
+      const marketUpdatedAt = st.market_updated_at || st.updated_at || nowIso;
+      const colonisation = isColonisationVessel({
+        stationName: st.name,
+        stationType: st.type,
+        government: st.government,
+      });
+      const carrier = !colonisation && isFleetCarrier(st.type, st.name);
+
+      const sysRec = await upsertSystem({
+        name: st.system_name,
+        systemAddress: st.system_id64 ?? null,
+        x: st.system_x ?? null,
+        y: st.system_y ?? null,
+        z: st.system_z ?? null,
+        population: (st.system_population ?? 0) > 0 ? st.system_population : 1,
+        isUnderColonisation: colonisation,
+        updatedAt: marketUpdatedAt,
+      });
+
+      const cleanedName = cleanStationName(st.name);
+      const pads = {
+        Small: st.small_pads ?? 0,
+        Medium: st.medium_pads ?? 0,
+        Large: st.large_pads ?? 0,
+      };
+      const maxPad = inferMaxLandingPad(
+        pads,
+        st.type ?? (carrier ? "FleetCarrier" : null),
+        colonisation,
+      );
+
+      const services: string[] = [];
+      if (Array.isArray(st.services)) {
+        for (const svc of st.services) {
+          const sName = typeof svc === "string" ? svc : svc?.name;
+          if (sName?.trim()) services.push(sName.trim().toLowerCase());
+        }
+      }
+      const hasBlackmarket = services.some(
+        (s) => s.includes("black market") || s.includes("blackmarket"),
+      );
+
+      await upsertStationMeta({
+        marketId: st.market_id,
+        systemId: sysRec.id,
+        name: cleanedName,
+        stationType: st.type ?? (carrier ? "FleetCarrier" : null),
+        isFleetCarrier: carrier,
+        isColonisationVessel: colonisation,
+        maxLandingPad: maxPad,
+        padSmall: st.small_pads ?? null,
+        padMedium: st.medium_pads ?? null,
+        padLarge: st.large_pads ?? null,
+        distanceToArrivalLs: st.distance_to_arrival ?? null,
+        controllingFaction:
+          st.controlling_minor_faction &&
+          st.controlling_minor_faction.toLowerCase() !== "fleetcarrier"
+            ? st.controlling_minor_faction
+            : null,
+        government: cleanFdevToken(st.government),
+        primaryEconomy: cleanFdevToken(st.primary_economy),
+        hasBlackmarket,
+        services: services.length > 0 ? services : null,
+        metaUpdatedAt: marketUpdatedAt,
+      });
+
+      if (Array.isArray(st.market) && st.market.length > 0) {
+        const items: MarketCommodityItem[] = [];
+        for (const entry of st.market) {
+          if (!entry.commodity) continue;
+          const key = entry.commodity.trim().toLowerCase();
+          let commodityId = commodityByNameOrSymbol.get(key);
+          if (commodityId === undefined) {
+            commodityId = await resolveCommodityId(entry.commodity);
+            commodityByNameOrSymbol.set(key, commodityId);
+          }
+
+          items.push({
+            commodityId,
+            meanPrice: 0,
+            buyPrice: Math.max(0, Math.trunc(entry.buy_price ?? 0)),
+            stock: Math.max(0, Math.trunc(entry.supply ?? 0)),
+            stockBracket: (entry.supply ?? 0) > 0 ? 2 : 0,
+            sellPrice: Math.max(0, Math.trunc(entry.sell_price ?? 0)),
+            demand: Math.max(0, Math.trunc(entry.demand ?? 0)),
+            demandBracket: (entry.demand ?? 0) > 0 ? 2 : 0,
+            statusFlags: null,
+          });
+        }
+
+        await upsertStationMarket({
+          marketId: st.market_id,
+          systemId: sysRec.id,
+          stationName: cleanedName,
+          stationType: st.type ?? (carrier ? "FleetCarrier" : null),
+          isFleetCarrier: carrier,
+          isColonisationVessel: colonisation,
+          maxLandingPad: maxPad,
+          marketUpdatedAt,
+          items,
+        });
+      }
+    }
+  } catch {
+    // Ignore Spansh timeout/network errors
+  }
+}
+
+/**
+ * Resolves a specific market (station, outpost, settlement, or Fleet Carrier) by name
+ * (and optional system filter) and returns its station metadata along with all matching
+ * commodity listings.
+ */
+export async function getStationMarketListings(
+  params: GetMarketListingsParams,
+): Promise<{
+  station: MarketStationInfo | null;
+  listings: MarketItemRow[];
+}> {
+  const stationQuery = params.station.trim();
+  if (!stationQuery) {
+    return { station: null, listings: [] };
+  }
+
+  const systemFilter = params.system?.trim() || null;
+  const filter: MarketListingsFilter = params.filter ?? "all";
+  const commodityFilter = params.commodityQuery?.trim() || null;
+  const minStock = Math.max(0, params.minStock ?? 0);
+  const minDemand = Math.max(0, params.minDemand ?? 0);
+  const sortBy: MarketListingsSortBy = params.sortBy ?? "category";
+  const limit = Math.min(200, Math.max(1, params.limit ?? 150));
+
+  const escapedStation = stationQuery.replace(/[\\%_]/g, "\\$&");
+  const substringPattern = `%${escapedStation}%`;
+  const prefixPattern = `${escapedStation}%`;
+
+  const queryStation = async (): Promise<MarketStationInfo | null> => {
+    const exactRows = await sql<MarketStationInfo[]>`
+      SELECT
+        st.market_id::text AS market_id,
+        st.name AS station_name,
+        st.station_type,
+        st.is_fleet_carrier,
+        st.is_colonisation_vessel,
+        st.max_landing_pad,
+        st.distance_to_arrival_ls,
+        st.controlling_faction,
+        st.controlling_faction_state,
+        st.government,
+        st.primary_economy,
+        st.has_blackmarket,
+        sys.id::int AS system_id,
+        sys.name AS system_name,
+        st.market_updated_at,
+        st.updated_at,
+        (SELECT COUNT(*)::int FROM market_listings ml WHERE ml.market_id = st.market_id) AS total_listings_count,
+        (SELECT COUNT(*)::int FROM market_listings ml WHERE ml.market_id = st.market_id AND ml.buy_price > 0 AND ml.stock > 0) AS supply_count,
+        (SELECT COUNT(*)::int FROM market_listings ml WHERE ml.market_id = st.market_id AND ml.sell_price > 0 AND ml.demand > 0) AS demand_count
+      FROM stations st
+      JOIN systems sys ON sys.id = st.system_id
+      WHERE (LOWER(st.name) = LOWER(${stationQuery}) OR st.market_id::text = ${stationQuery})
+        AND (${systemFilter}::text IS NULL OR LOWER(sys.name) = LOWER(${systemFilter}))
+      ORDER BY
+        ((SELECT COUNT(*) FROM market_listings ml WHERE ml.market_id = st.market_id) > 0) DESC,
+        st.is_fleet_carrier ASC,
+        st.market_updated_at DESC NULLS LAST,
+        st.updated_at DESC
+      LIMIT 1
+    `;
+    if (exactRows[0]) return exactRows[0];
+
+    const fuzzyRows = await sql<MarketStationInfo[]>`
+      SELECT
+        st.market_id::text AS market_id,
+        st.name AS station_name,
+        st.station_type,
+        st.is_fleet_carrier,
+        st.is_colonisation_vessel,
+        st.max_landing_pad,
+        st.distance_to_arrival_ls,
+        st.controlling_faction,
+        st.controlling_faction_state,
+        st.government,
+        st.primary_economy,
+        st.has_blackmarket,
+        sys.id::int AS system_id,
+        sys.name AS system_name,
+        st.market_updated_at,
+        st.updated_at,
+        (SELECT COUNT(*)::int FROM market_listings ml WHERE ml.market_id = st.market_id) AS total_listings_count,
+        (SELECT COUNT(*)::int FROM market_listings ml WHERE ml.market_id = st.market_id AND ml.buy_price > 0 AND ml.stock > 0) AS supply_count,
+        (SELECT COUNT(*)::int FROM market_listings ml WHERE ml.market_id = st.market_id AND ml.sell_price > 0 AND ml.demand > 0) AS demand_count
+      FROM stations st
+      JOIN systems sys ON sys.id = st.system_id
+      WHERE st.name ILIKE ${substringPattern}
+        AND (${systemFilter}::text IS NULL OR LOWER(sys.name) = LOWER(${systemFilter}))
+      ORDER BY
+        CASE WHEN LOWER(st.name) LIKE LOWER(${prefixPattern}) THEN 0 ELSE 1 END,
+        ((SELECT COUNT(*) FROM market_listings ml WHERE ml.market_id = st.market_id) > 0) DESC,
+        st.is_fleet_carrier ASC,
+        LENGTH(st.name) ASC,
+        st.market_updated_at DESC NULLS LAST
+      LIMIT 1
+    `;
+    return fuzzyRows[0] ?? null;
+  };
+
+  let station = await queryStation();
+
+  if (!station || station.total_listings_count === 0) {
+    await hydrateStationMarketOnDemand(
+      station?.station_name ?? stationQuery,
+      station?.system_name ?? systemFilter,
+    );
+    station = await queryStation();
+  }
+
+  if (!station) {
+    return { station: null, listings: [] };
+  }
+
+  const commodityPattern = commodityFilter
+    ? `%${commodityFilter.replace(/[\\%_]/g, "\\$&")}%`
+    : null;
+
+  const listings = await sql<MarketItemRow[]>`
+    SELECT
+      c.id AS commodity_id,
+      c.symbol AS commodity_symbol,
+      c.name AS commodity_name,
+      c.category AS commodity_category,
+      c.is_rare,
+      ml.mean_price,
+      ml.buy_price,
+      ml.stock,
+      ml.stock_bracket,
+      ml.sell_price,
+      ml.demand,
+      ml.demand_bracket,
+      ml.status_flags,
+      ml.updated_at
+    FROM market_listings ml
+    JOIN commodities c ON c.id = ml.commodity_id
+    WHERE ml.market_id = ${station.market_id}::bigint
+      AND (
+        (${filter} = 'supply' AND ml.buy_price > 0 AND ml.stock >= ${Math.max(1, minStock)})
+        OR (${filter} = 'demand' AND ml.sell_price > 0 AND ml.demand >= ${minDemand})
+        OR (
+          ${filter} = 'all'
+          AND (${minStock} = 0 OR (ml.buy_price > 0 AND ml.stock >= ${minStock}))
+          AND (${minDemand} = 0 OR (ml.sell_price > 0 AND ml.demand >= ${minDemand}))
+        )
+      )
+      AND (
+        ${commodityPattern}::text IS NULL
+        OR c.name ILIKE ${commodityPattern}
+        OR c.symbol ILIKE ${commodityPattern}
+        OR c.category ILIKE ${commodityPattern}
+      )
+    ORDER BY
+      CASE WHEN ${sortBy} = 'category' THEN c.category END ASC,
+      CASE WHEN ${sortBy} = 'sell_price' THEN ml.sell_price END DESC,
+      CASE WHEN ${sortBy} = 'buy_price' AND ml.buy_price > 0 THEN 0 WHEN ${sortBy} = 'buy_price' THEN 1 END ASC,
+      CASE WHEN ${sortBy} = 'buy_price' THEN ml.buy_price END ASC,
+      CASE WHEN ${sortBy} = 'stock' THEN ml.stock END DESC,
+      CASE WHEN ${sortBy} = 'demand' THEN ml.demand END DESC,
+      c.name ASC
+    LIMIT ${limit}
+  `;
+
+  return { station, listings };
 }
