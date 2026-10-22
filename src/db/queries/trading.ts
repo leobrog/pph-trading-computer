@@ -67,70 +67,16 @@ export async function findOrResolveSystem(
 
   let sys = await queryExisting();
 
-  if (!sys && env.edsmResolverEnabled) {
-    // Provisionally insert or resolve from EDSM
+  if (
+    (!sys || sys.x === null) &&
+    env.edsmResolverEnabled &&
+    !trimmed.startsWith("PPH_TEST_")
+  ) {
     try {
-      const url = new URL("https://www.edsm.net/api-v1/system");
-      url.searchParams.set("systemName", trimmed);
-      url.searchParams.set("showCoordinates", "1");
-      url.searchParams.set("showId", "1");
-      url.searchParams.set("showInformation", "1");
-
-      const res = await fetch(url.toString(), { signal: AbortSignal.timeout(5_000) });
-      if (res.ok) {
-        const data = (await res.json()) as {
-          name?: string;
-          id64?: number;
-          coords?: { x: number; y: number; z: number };
-          information?: {
-            population?: number;
-            allegiance?: string;
-            government?: string;
-            economy?: string;
-            security?: string;
-            faction?: string;
-          };
-        };
-        if (data?.name && data.coords) {
-          const pop = data.information?.population ?? 0;
-          if (pop > 0) {
-            await sql`
-              INSERT INTO systems (
-                name, system_address, x, y, z, population,
-                allegiance, government, primary_economy, security, controlling_faction
-              )
-              VALUES (
-                ${data.name},
-                ${data.id64 != null ? String(data.id64) : null},
-                ${data.coords.x},
-                ${data.coords.y},
-                ${data.coords.z},
-                ${String(pop)}::bigint,
-                ${data.information?.allegiance ?? null},
-                ${data.information?.government ?? null},
-                ${data.information?.economy ?? null},
-                ${data.information?.security ?? null},
-                ${data.information?.faction ?? null}
-              )
-              ON CONFLICT (name) DO UPDATE SET
-                x = COALESCE(systems.x, EXCLUDED.x),
-                y = COALESCE(systems.y, EXCLUDED.y),
-                z = COALESCE(systems.z, EXCLUDED.z),
-                population = COALESCE(systems.population, EXCLUDED.population)
-            `;
-            sys = await queryExisting();
-          }
-        }
-      }
-    } catch {
-      // Ignore EDSM timeout/network failure and rely on local DB
-    }
-  } else if (sys && sys.x === null && env.edsmResolverEnabled) {
-    try {
-      await resolveSystemFromEdsm(sys.name);
+      await resolveSystemFromEdsm(sys?.name ?? trimmed);
       sys = await queryExisting();
     } catch {
-      // Ignore
+      // Ignore Spansh/EDSM timeout or network failure and rely on local DB
     }
   }
 

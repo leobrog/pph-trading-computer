@@ -239,7 +239,199 @@ async function hydrateSystemBgsOnDemand(
     systemAddress = null;
   }
 
-  // 1. Fetch EDSM factions (provides happiness, active/pending/recovering states, and unix lastUpdate)
+  // 1. Primary: Fetch from Spansh (ingests full live EDDN stream with factions, stations, and id64)
+  try {
+    interface SpanshHydrateRecord {
+      id64?: number;
+      name?: string;
+      updated_at?: string;
+      controlling_minor_faction?: string;
+      minor_faction_presences?: Array<{
+        name?: string;
+        allegiance?: string;
+        government?: string;
+        influence?: number;
+        state?: string;
+        active_states?: string[];
+        pending_states?: string[];
+        recovering_states?: string[];
+      }>;
+      stations?: Array<{
+        market_id?: number;
+        name?: string;
+        type?: string;
+        controlling_minor_faction?: string;
+        distance_to_arrival?: number;
+        small_pads?: number;
+        medium_pads?: number;
+        large_pads?: number;
+        has_large_pad?: boolean;
+        government?: string;
+        primary_economy?: string;
+        services?: Array<{ name?: string } | string>;
+      }>;
+    }
+
+    let spRecord: SpanshHydrateRecord | null = null;
+
+    if (systemAddress) {
+      const spRes = await fetch(`https://spansh.co.uk/api/system/${systemAddress}`, {
+        headers: { "User-Agent": "PPH-Trading-Computer/1.0" },
+        signal: AbortSignal.timeout(4_500),
+      });
+      if (spRes.ok) {
+        const spData = (await spRes.json()) as { record?: SpanshHydrateRecord };
+        spRecord = spData?.record ?? null;
+      }
+    }
+
+    if (!spRecord || !Array.isArray(spRecord.stations)) {
+      const searchRes = await fetch("https://spansh.co.uk/api/systems/search", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": "PPH-Trading-Computer/1.0",
+        },
+        body: JSON.stringify({
+          filters: { name: { value: systemName } },
+          size: 5,
+          page: 0,
+        }),
+        signal: AbortSignal.timeout(4_500),
+      });
+      if (searchRes.ok) {
+        const searchData = (await searchRes.json()) as {
+          results?: SpanshHydrateRecord[];
+        };
+        const match = (searchData.results ?? []).find(
+          (r) => r.name?.trim().toLowerCase() === systemName.trim().toLowerCase(),
+        );
+        if (match) {
+          spRecord = {
+            ...match,
+            minor_faction_presences:
+              spRecord?.minor_faction_presences ?? match.minor_faction_presences,
+            updated_at: spRecord?.updated_at ?? match.updated_at,
+          };
+        }
+      }
+    }
+
+    if (spRecord) {
+      const spanshUpdatedAt = spRecord.updated_at || new Date().toISOString();
+
+      if (!systemAddress && spRecord.id64) {
+        systemAddress = String(spRecord.id64);
+        await sql`
+          UPDATE systems
+          SET system_address = COALESCE(system_address, ${systemAddress}::bigint)
+          WHERE id = ${systemId}
+        `;
+      }
+
+      if (spRecord.controlling_minor_faction) {
+        await sql`
+          UPDATE systems
+          SET controlling_faction = COALESCE(${spRecord.controlling_minor_faction}, controlling_faction)
+          WHERE id = ${systemId}
+        `;
+      }
+
+      if (
+        Array.isArray(spRecord.minor_faction_presences) &&
+        spRecord.minor_faction_presences.length > 0
+      ) {
+        const mapStrings = (arr?: string[]): FactionStateEntry[] =>
+          Array.isArray(arr)
+            ? arr
+                .map((s) => cleanFdevToken(s) ?? s)
+                .filter((s): s is string => Boolean(s && s !== "None"))
+                .map((State) => ({ State }))
+            : [];
+
+        const normalized: NormalizedFactionInput[] = spRecord.minor_faction_presences
+          .filter((f) => f?.name && (f.influence ?? 0) > 0)
+          .map((f) => {
+            const active = mapStrings(f.active_states);
+            if (active.length === 0 && f.state && f.state !== "None") {
+              active.push({ State: cleanFdevToken(f.state) ?? f.state });
+            }
+            return {
+              name: f.name!.trim(),
+              allegiance: cleanFdevToken(f.allegiance),
+              government: cleanFdevToken(f.government),
+              influence: typeof f.influence === "number" ? f.influence : null,
+              factionState: cleanFdevToken(f.state),
+              happiness: null,
+              activeStates: active,
+              pendingStates: mapStrings(f.pending_states),
+              recoveringStates: mapStrings(f.recovering_states),
+            };
+          });
+
+        await upsertSystemFactions(systemId, normalized, spanshUpdatedAt);
+      }
+
+      if (Array.isArray(spRecord.stations) && spRecord.stations.length > 0) {
+        for (const st of spRecord.stations) {
+          if (!st.market_id || !st.name) continue;
+          const colonisation = isColonisationVessel({
+            stationName: st.name,
+            stationType: st.type,
+            government: st.government,
+          });
+          const carrier = !colonisation && isFleetCarrier(st.type, st.name);
+          if (carrier) continue;
+
+          const cleanedName = cleanStationName(st.name);
+          const pads = {
+            Small: st.small_pads ?? 0,
+            Medium: st.medium_pads ?? 0,
+            Large: st.large_pads ?? (st.has_large_pad ? 1 : 0),
+          };
+          const maxPad = inferMaxLandingPad(pads, st.type, colonisation);
+          const services: string[] = [];
+          if (Array.isArray(st.services)) {
+            for (const svc of st.services) {
+              const sName = typeof svc === "string" ? svc : svc?.name;
+              if (sName?.trim()) services.push(sName.trim().toLowerCase());
+            }
+          }
+          const hasBlackmarket = services.some(
+            (s) => s.includes("black market") || s.includes("blackmarket"),
+          );
+
+          await upsertStationMeta({
+            marketId: st.market_id,
+            systemId,
+            name: cleanedName,
+            stationType: st.type ?? null,
+            isFleetCarrier: false,
+            isColonisationVessel: colonisation,
+            maxLandingPad: maxPad,
+            padSmall: st.small_pads ?? null,
+            padMedium: st.medium_pads ?? null,
+            padLarge: st.large_pads ?? null,
+            distanceToArrivalLs: st.distance_to_arrival ?? null,
+            controllingFaction:
+              st.controlling_minor_faction &&
+              st.controlling_minor_faction.toLowerCase() !== "fleetcarrier"
+                ? st.controlling_minor_faction
+                : null,
+            government: cleanFdevToken(st.government),
+            primaryEconomy: cleanFdevToken(st.primary_economy),
+            hasBlackmarket,
+            services: services.length > 0 ? services : null,
+            metaUpdatedAt: spanshUpdatedAt,
+          });
+        }
+      }
+    }
+  } catch {
+    // Ignore Spansh timeout/network errors
+  }
+
+  // 2. Secondary supplement/fallback: Fetch EDSM factions (enriches happiness or acts as fallback if Spansh is down)
   try {
     const factionsUrl = new URL("https://www.edsm.net/api-system-v1/factions");
     factionsUrl.searchParams.set("systemName", systemName);
@@ -277,7 +469,7 @@ async function hydrateSystemBgsOnDemand(
       if (data?.controllingFaction?.name) {
         await sql`
           UPDATE systems
-          SET controlling_faction = COALESCE(${data.controllingFaction.name}, controlling_faction)
+          SET controlling_faction = COALESCE(controlling_faction, ${data.controllingFaction.name})
           WHERE id = ${systemId}
         `;
       }
@@ -326,70 +518,7 @@ async function hydrateSystemBgsOnDemand(
     // Ignore EDSM network/timeout errors
   }
 
-  // 2. Fetch Spansh direct system endpoint by id64 (ingests full live EDDN stream like Inara)
-  if (systemAddress) {
-    try {
-      const spRes = await fetch(`https://spansh.co.uk/api/system/${systemAddress}`, {
-        headers: { "User-Agent": "PPH-Trading-Computer/1.0" },
-        signal: AbortSignal.timeout(4_500),
-      });
-      if (spRes.ok) {
-        const spData = (await spRes.json()) as {
-          record?: {
-            updated_at?: string;
-            controlling_minor_faction?: string;
-            minor_faction_presences?: Array<{
-              name?: string;
-              allegiance?: string;
-              government?: string;
-              influence?: number;
-              state?: string;
-              active_states?: string[];
-              pending_states?: string[];
-              recovering_states?: string[];
-            }>;
-          };
-        };
-        const rec = spData?.record;
-        if (rec && Array.isArray(rec.minor_faction_presences) && rec.minor_faction_presences.length > 0) {
-          const spanshUpdatedAt = rec.updated_at || new Date().toISOString();
-          const mapStrings = (arr?: string[]): FactionStateEntry[] =>
-            Array.isArray(arr)
-              ? arr
-                  .map((s) => cleanFdevToken(s) ?? s)
-                  .filter((s): s is string => Boolean(s && s !== "None"))
-                  .map((State) => ({ State }))
-              : [];
-
-          const normalized: NormalizedFactionInput[] = rec.minor_faction_presences
-            .filter((f) => f?.name && (f.influence ?? 0) > 0)
-            .map((f) => {
-              const active = mapStrings(f.active_states);
-              if (active.length === 0 && f.state && f.state !== "None") {
-                active.push({ State: cleanFdevToken(f.state) ?? f.state });
-              }
-              return {
-                name: f.name!.trim(),
-                allegiance: cleanFdevToken(f.allegiance),
-                government: cleanFdevToken(f.government),
-                influence: typeof f.influence === "number" ? f.influence : null,
-                factionState: cleanFdevToken(f.state),
-                happiness: null,
-                activeStates: active,
-                pendingStates: mapStrings(f.pending_states),
-                recoveringStates: mapStrings(f.recovering_states),
-              };
-            });
-
-          await upsertSystemFactions(systemId, normalized, spanshUpdatedAt);
-        }
-      }
-    } catch {
-      // Ignore Spansh timeout/network errors
-    }
-  }
-
-  // 3. Also hydrate permanent stations from EDSM if none are recorded for this system yet
+  // 3. Fallback: Only query EDSM stations if no permanent stations were recorded from EDDN or Spansh
   try {
     const existingCount = await sql<{ count: number }[]>`
       SELECT COUNT(*)::int AS count FROM stations WHERE system_id = ${systemId}
