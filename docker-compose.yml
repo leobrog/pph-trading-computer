@@ -1,0 +1,65 @@
+services:
+  db:
+    image: postgres:18-alpine
+    container_name: pph-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pph}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pph_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-pph_trading}
+    volumes:
+      - pgdata:/var/lib/postgresql
+    networks:
+      - pph-net
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "work_mem=16MB"
+      - "-c"
+      - "synchronous_commit=off"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pph} -d ${POSTGRES_DB:-pph_trading}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  listener:
+    build: .
+    container_name: pph-eddn-listener
+    restart: unless-stopped
+    command: ["bun", "run", "src/listener/index.ts"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-pph}:${POSTGRES_PASSWORD:-pph_secret}@db:5432/${POSTGRES_DB:-pph_trading}
+    networks:
+      - pph-net
+    depends_on:
+      db:
+        condition: service_healthy
+
+  bot:
+    build: .
+    container_name: pph-discord-bot
+    restart: unless-stopped
+    command: ["bun", "run", "src/bot/index.ts"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-pph}:${POSTGRES_PASSWORD:-pph_secret}@db:5432/${POSTGRES_DB:-pph_trading}
+    networks:
+      - pph-net
+    depends_on:
+      db:
+        condition: service_healthy
+
+networks:
+  pph-net:
+    driver: bridge
+
+volumes:
+  pgdata:

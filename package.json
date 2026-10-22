@@ -1,0 +1,25 @@
+{
+  "name": "pph-trading-computer",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "typecheck": "bun check",
+    "test": "bun test",
+    "migrate": "bun run scripts/migrate.ts",
+    "seed:commodities": "bun run scripts/seed-commodities.ts",
+    "seed:region": "bun run scripts/seed-region.ts",
+    "deploy-commands": "bun run scripts/deploy-commands.ts",
+    "listener": "bun run src/listener/index.ts",
+    "bot": "bun run src/bot/index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  },
+  "dependencies": {
+    "discord.js": "^14.27.0"
+  }
+}
